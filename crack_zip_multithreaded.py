@@ -41,9 +41,9 @@ class ZipCracker:
         # 注册信号处理
         signal.signal(signal.SIGINT, self.handle_interrupt)
         
-        # 缓存已尝试的密码结果
-        self.password_results = {}
-        self.results_lock = threading.Lock()
+        # 缓存最小文件信息（用于快速密码测试）
+        self.test_file_info = None
+        self.test_file_lock = threading.Lock()
         
         # 检查是否有检查点
         self.load_checkpoint()
@@ -125,81 +125,86 @@ class ZipCracker:
                 return False
         return False
     
-    def extract_file_from_zip(self, zip_file, password_str, temp_dir):
-        """从ZIP文件中提取内容并检查是否成功"""
+    def get_test_file_info(self, zip_file):
+        """获取用于测试的最小文件信息（缓存）"""
+        if self.test_file_info is None:
+            with self.test_file_lock:
+                # 双重检查锁定
+                if self.test_file_info is None:
+                    namelist = zip_file.namelist()
+                    if not namelist:
+                        self.test_file_info = None
+                        return None
+                    
+                    # 找出最小的非目录文件
+                    smallest_file = None
+                    smallest_size = float('inf')
+                    
+                    for name in namelist:
+                        try:
+                            info = zip_file.getinfo(name)
+                            # 跳过目录和空文件
+                            if name.endswith('/') or info.file_size == 0:
+                                continue
+                            # 找出文件大小最小的文件
+                            if info.file_size < smallest_size:
+                                smallest_file = name
+                                smallest_size = info.file_size
+                        except:
+                            continue
+                    
+                    self.test_file_info = smallest_file
+        
+        return self.test_file_info
+    
+    def test_password(self, zip_file, password_str):
+        """快速测试密码是否正确（不实际解压到磁盘）"""
         try:
-            # 尝试选择一个较小的文件来解压，以加快速度
-            namelist = zip_file.namelist()
+            # 获取测试文件
+            test_file = self.get_test_file_info(zip_file)
             
-            # 如果文件列表为空，无法选择文件进行解压测试
-            if not namelist:
-                # 尝试解压所有文件
-                zip_file.extractall(path=temp_dir, pwd=password_str.encode('utf-8'))
-                return True
-                
-            # 选择第一个文件进行解压测试，通常是较小的文件
-            smallest_file = namelist[0]
+            if test_file is None:
+                # 如果没有合适的测试文件，尝试读取第一个文件
+                namelist = zip_file.namelist()
+                if not namelist:
+                    return False
+                test_file = namelist[0]
             
-            # 找出最小的非目录文件
-            for name in namelist:
-                try:
-                    info = zip_file.getinfo(name)
-                    # 跳过目录
-                    if name.endswith('/') or info.file_size == 0:
-                        continue
-                    # 找出文件大小最小的文件
-                    if info.file_size < zip_file.getinfo(smallest_file).file_size or smallest_file.endswith('/'):
-                        smallest_file = name
-                except:
-                    continue
-
-            # 尝试仅解压这个小文件进行测试
-            zip_file.extract(smallest_file, path=temp_dir, pwd=password_str.encode('utf-8'))
+            # 尝试读取文件内容（只读取少量字节）
+            # 这比实际解压到磁盘快得多
+            with zip_file.open(test_file, pwd=password_str.encode('utf-8')) as f:
+                # 只读取前1024字节来验证密码
+                f.read(1024)
             
-            # 检查是否成功解压
-            if os.listdir(temp_dir):
-                return True
+            return True
+            
+        except RuntimeError as e:
+            # 密码错误会抛出 RuntimeError
+            if "Bad password" in str(e) or "password" in str(e).lower():
+                return False
+            # 其他 RuntimeError 可能是文件问题
             return False
-        except (RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
-            # 密码不正确
+        except (zipfile.BadZipFile, zipfile.LargeZipFile):
+            # ZIP文件问题
             return False
         except Exception as e:
-            # 其他错误，但可能是因为文件被部分解压了，也可能是密码正确
+            # 其他异常
             error_type = str(e)
-            if "Error -3 while decompressing data" in error_type:
-                # 这种错误通常在密码正确但文件损坏时出现
-                # 尝试检查是否有任何文件被解压出来
-                if os.listdir(temp_dir):
-                    # 如果有文件解压出来，虽然有错误，但可能密码是正确的
-                    # 再次尝试完整解压以确认
-                    try:
-                        # 清空临时目录
-                        for item in os.listdir(temp_dir):
-                            item_path = os.path.join(temp_dir, item)
-                            if os.path.isfile(item_path):
-                                os.unlink(item_path)
-                            elif os.path.isdir(item_path):
-                                shutil.rmtree(item_path)
-                        
-                        # 再次尝试解压所有文件
-                        zip_file.extractall(path=temp_dir, pwd=password_str.encode('utf-8'))
-                        if os.listdir(temp_dir):
-                            return True
-                    except:
-                        pass
+            # 某些情况下即使密码正确也可能出错，但至少通过了密码验证
+            if "Bad password" not in error_type and "password" not in error_type.lower():
+                # 可能密码是正确的，只是文件有问题
+                # 为了安全起见，再次验证
+                try:
+                    # 尝试获取文件信息
+                    zip_file.getinfo(test_file)
+                    return True
+                except:
+                    pass
             
-            with self.error_lock:
-                if error_type in self.error_counts:
-                    self.error_counts[error_type] += 1
-                else:
-                    self.error_counts[error_type] = 1
-                    print(f"尝试密码时发生新类型错误: {error_type}")
             return False
         
     def worker(self, password_queue, zip_file):
         """工作线程函数"""
-        # 创建临时目录用于尝试解压
-        temp_dir = tempfile.mkdtemp()
         try:
             while self.running and not self.password_found:
                 password_batch = None
@@ -216,12 +221,6 @@ class ZipCracker:
                             password_queue.task_done()
                             return
                             
-                        # 检查是否已经尝试过这个密码
-                        with self.results_lock:
-                            if password_str in self.password_results:
-                                # 如果已经尝试过，跳过
-                                continue
-                            
                         with self.count_lock:
                             self.count += 1
                             current_count = self.count
@@ -230,20 +229,8 @@ class ZipCracker:
                             if current_count % 10000 == 0:
                                 self.save_checkpoint()
                         
-                        # 清空临时目录
-                        for item in os.listdir(temp_dir):
-                            item_path = os.path.join(temp_dir, item)
-                            if os.path.isfile(item_path):
-                                os.unlink(item_path)
-                            elif os.path.isdir(item_path):
-                                shutil.rmtree(item_path)
-                        
-                        # 尝试解压
-                        success = self.extract_file_from_zip(zip_file, password_str, temp_dir)
-                        
-                        # 记录结果
-                        with self.results_lock:
-                            self.password_results[password_str] = success
+                        # 快速测试密码（不写入磁盘，速度更快）
+                        success = self.test_password(zip_file, password_str)
                         
                         if success:
                             # 密码找到了
@@ -280,10 +267,9 @@ class ZipCracker:
                             pass
                     break
         finally:
-            # 清理临时目录
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            pass  # 不再需要清理临时目录
     
-    def generate_passwords(self, digit_length, start_pos=0, batch_size=100):
+    def generate_passwords(self, digit_length, start_pos=0, batch_size=500):
         """生成指定位数的所有可能密码，按批次返回，支持从指定位置开始"""
         batch = []
         # 跳过到开始位置
@@ -388,7 +374,7 @@ class ZipCracker:
                 print(f"共有 {total_for_length} 种可能组合，剩余 {remaining} 种未尝试")
                 
                 # 生成密码批次并放入队列
-                for password_batch in self.generate_passwords(digit_length, start_pos, batch_size=100):
+                for password_batch in self.generate_passwords(digit_length, start_pos, batch_size=500):
                     password_queue.put(password_batch)
                     
                     if self.password_found:
