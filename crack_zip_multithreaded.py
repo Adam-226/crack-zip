@@ -33,6 +33,7 @@ class ZipCracker:
         self.current_length = min_digits  # 当前正在尝试的位数
         self.current_position = 0  # 当前位数已尝试到的位置
         self.elapsed_time = 0  # 之前已花费的时间
+        self.position_base = 0  # 用于跟踪当前位数的起始计数
         
         # 设置线程数，默认使用CPU核心数
         self.threads = threads if threads else multiprocessing.cpu_count()
@@ -50,18 +51,30 @@ class ZipCracker:
     def handle_interrupt(self, sig, frame):
         """处理Ctrl+C中断"""
         print("\n\n中断检测到! 正在保存进度...")
-        self.save_checkpoint()
         self.running = False
+        self.save_checkpoint()
+        print("进度已保存，程序即将退出...")
+        # 强制退出程序
+        sys.exit(0)
     
     def save_checkpoint(self):
         """保存当前进度到检查点文件"""
-        checkpoint = {
-            "count": self.count,
-            "current_length": self.current_length,
-            "current_position": self.current_position,
-            "elapsed_time": time.time() - self.start_time + self.elapsed_time,
-            "error_counts": self.error_counts
-        }
+        # 尝试获取锁，如果获取不到就使用当前已知的值
+        # 这样可以避免在信号处理中死锁
+        lock_acquired = self.count_lock.acquire(blocking=False)
+        try:
+            # 计算当前位数的实际位置
+            actual_position = self.count - self.position_base
+            checkpoint = {
+                "count": self.count,
+                "current_length": self.current_length,
+                "current_position": actual_position,
+                "elapsed_time": time.time() - self.start_time + self.elapsed_time,
+                "error_counts": self.error_counts
+            }
+        finally:
+            if lock_acquired:
+                self.count_lock.release()
         
         try:
             with open(self.checkpoint_file, 'w', encoding='utf-8') as f:
@@ -78,10 +91,25 @@ class ZipCracker:
                     checkpoint = json.load(f)
                 
                 self.count = checkpoint.get("count", 0)
-                self.current_length = checkpoint.get("current_length", self.min_digits)
+                loaded_length = checkpoint.get("current_length", self.min_digits)
                 self.current_position = checkpoint.get("current_position", 0)
                 self.elapsed_time = checkpoint.get("elapsed_time", 0)
                 self.error_counts = checkpoint.get("error_counts", {})
+                
+                # 验证 current_length 是否在有效范围内
+                if loaded_length < self.min_digits or loaded_length > self.max_digits:
+                    print(f"警告: 检查点中的位数 {loaded_length} 超出范围 {self.min_digits}-{self.max_digits}")
+                    print("将从头开始破解")
+                    self.count = 0
+                    self.current_length = self.min_digits
+                    self.current_position = 0
+                    self.elapsed_time = 0
+                    return False
+                
+                self.current_length = loaded_length
+                
+                # 计算之前位数的密码总数，用于设置 position_base
+                self.position_base = sum(10**d for d in range(self.min_digits, self.current_length))
                 
                 print(f"从上次中断处继续: 已尝试 {self.count} 个密码")
                 print(f"当前位数: {self.current_length}, 位置: {self.current_position}")
@@ -174,6 +202,7 @@ class ZipCracker:
         temp_dir = tempfile.mkdtemp()
         try:
             while self.running and not self.password_found:
+                password_batch = None
                 try:
                     # 非阻塞方式获取密码，如果队列为空就退出
                     try:
@@ -183,7 +212,9 @@ class ZipCracker:
                     
                     for password_str in password_batch:
                         if not self.running or self.password_found:
-                            break
+                            # 标记任务完成后再退出
+                            password_queue.task_done()
+                            return
                             
                         # 检查是否已经尝试过这个密码
                         with self.results_lock:
@@ -197,7 +228,6 @@ class ZipCracker:
                             
                             # 定期保存检查点，每10000个密码
                             if current_count % 10000 == 0:
-                                self.current_position += 10000  # 更新位置
                                 self.save_checkpoint()
                         
                         # 清空临时目录
@@ -233,13 +263,21 @@ class ZipCracker:
                                 except:
                                     pass
                             
-                            break
+                            # 标记任务完成后再退出
+                            password_queue.task_done()
+                            return
                     
-                    # 标记此批次已处理完毕
+                    # 正常完成批次处理，标记任务完成
                     password_queue.task_done()
                     
                 except Exception as e:
                     print(f"工作线程发生错误: {e}")
+                    # 如果获取到了任务，确保标记为完成
+                    if password_batch is not None:
+                        try:
+                            password_queue.task_done()
+                        except:
+                            pass
                     break
         finally:
             # 清理临时目录
@@ -330,9 +368,15 @@ class ZipCracker:
                 if self.password_found or not self.running:
                     break
                 
-                self.current_length = digit_length  # 更新当前位数
-                start_pos = self.current_position if digit_length == self.current_length else 0
-                self.current_position = start_pos  # 重置位置计数器，如果是新的位数
+                # 判断是否是恢复的位数还是新的位数
+                is_resumed = (digit_length == self.current_length)
+                start_pos = self.current_position if is_resumed else 0
+                
+                # 如果是新的位数，更新 position_base
+                if not is_resumed:
+                    self.current_length = digit_length
+                    self.position_base = sum(10**d for d in range(self.min_digits, digit_length))
+                    self.current_position = 0
                 
                 print(f"\n尝试 {digit_length} 位数字密码...")
                 if start_pos > 0:
@@ -359,10 +403,24 @@ class ZipCracker:
                     threads.append(t)
                 
                 # 等待所有密码尝试完毕或找到密码
-                password_queue.join()
+                # 使用循环检查而不是无限期等待，以便能快速响应密码找到的情况
+                while not self.password_found:
+                    try:
+                        # 使用超时的 join，这样可以定期检查 password_found 标志
+                        if password_queue.empty() and all(not t.is_alive() for t in threads):
+                            break
+                        time.sleep(0.1)
+                    except:
+                        break
                 
+                # 如果找到密码，立即停止所有线程
                 if self.password_found:
-                    # 密码找到了，删除检查点文件
+                    self.running = False
+                    # 等待所有线程停止
+                    for t in threads:
+                        if t.is_alive():
+                            t.join(timeout=1)
+                    # 删除检查点文件
                     if os.path.exists(self.checkpoint_file):
                         try:
                             os.remove(self.checkpoint_file)
@@ -374,11 +432,6 @@ class ZipCracker:
                 for t in threads:
                     if t.is_alive():
                         t.join(1)
-                
-                # 当前位数处理完毕，更新检查点
-                self.current_position = 0  # 重置位置
-                self.current_length = digit_length + 1  # 准备下一个位数
-                self.save_checkpoint()
             
             # 如果没有找到密码
             if not self.password_found and self.running:
@@ -456,12 +509,12 @@ class ZipCracker:
                     
                     # 计算该位数的密码总数和已完成的百分比
                     total_for_current = 10 ** self.current_length
-                    percent_current = min(100, (self.current_position + count_diff) / total_for_current * 100)
+                    current_in_this_length = current_count - self.position_base
+                    percent_current = min(100, current_in_this_length / total_for_current * 100)
                     
                     # 估计剩余时间
-                    total_combinations = sum(10**d for d in range(self.current_length, self.max_digits + 1))
-                    completed_combinations = sum(10**d for d in range(self.min_digits, self.current_length)) + self.current_position + count_diff
-                    remaining_combinations = total_combinations - completed_combinations
+                    total_combinations = sum(10**d for d in range(self.min_digits, self.max_digits + 1))
+                    remaining_combinations = total_combinations - current_count
                     
                     if speed > 0:
                         remaining_seconds = remaining_combinations / speed
